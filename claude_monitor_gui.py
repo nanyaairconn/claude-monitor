@@ -22,7 +22,8 @@ from pathlib import Path
 
 import claude_monitor
 from claude_monitor import (
-    Agg, blocks_of, data_dirs, fmt, load_entries, money, short_model,
+    ACTIVE_WINDOW_MINUTES, Agg, STATUSES, blocks_of, data_dirs, find_active_sessions,
+    fmt, load_entries, money, pretty_model, short_model,
 )
 
 try:
@@ -126,6 +127,16 @@ L = {
                              "如凭据文件不在默认位置，可在下方手动粘贴访问令牌（高级用法，\n"
                              "明文保存于本地 config.json，不会发送到除 Anthropic 官方接口以外的任何地方）。"),
         "set_token":       "访问令牌（可选，高级）",
+        "sess_title":     "活跃会话",
+        "sess_window":    "最近 {m} 分钟内有活动",
+        "sess_empty":     "当前没有活跃的 Claude Code 会话。",
+        "sess_note":      "上下文 = 最近一轮的估算历史长度（来自记录文件，非精确） · 会话总量 = 本会话累计 token · 与上方账号配额无关",
+        "col_session":    "会话",
+        "col_model":      "模型",
+        "col_context":    "上下文",
+        "col_turns":      "轮次",
+        "col_sess_total": "会话总量",
+        "col_reason":     "触发原因",
     },
     "en": {
         "block_title":   "Current 5-hour Window",
@@ -214,6 +225,16 @@ L = {
                              "the default location, you can paste an access token below (advanced;\n"
                              "stored in plain text in local config.json, sent only to Anthropic's API)."),
         "set_token":       "Access token (optional, advanced)",
+        "sess_title":     "Active Sessions",
+        "sess_window":    "activity in last {m} min",
+        "sess_empty":     "No active Claude Code sessions.",
+        "sess_note":      "Context = estimated history on the latest turn (from transcript, not exact) · Session total = cumulative tokens · Separate from account quota above",
+        "col_session":    "Session",
+        "col_model":      "Model",
+        "col_context":    "Context",
+        "col_turns":      "Turns",
+        "col_sess_total": "Session total",
+        "col_reason":     "Reason",
     },
 }
 
@@ -235,6 +256,20 @@ SELECT   = "#EBDDD3"
 FONT_SERIF = ("Georgia", 12, "bold")     # Claude-style serif headings
 FONT_UI    = ("Segoe UI", 9)
 FONT_MONO  = ("Consolas", 10)
+
+SESSION_ROWS_VISIBLE = 3  # table scrolls beyond this
+
+
+def session_rows(sessions):
+    """Active-session table rows, most urgent first (SWITCH > REVIEW > KEEP),
+    then most recently active. Status/metrics come from claude_monitor."""
+    ordered = sorted(sessions, key=lambda s: (-STATUSES.index(s["status"]),
+                                              -s["last"].timestamp()))
+    return [(s["status"], f"{s['project']} [{s['session_id'][:6]}]",
+             pretty_model(s["model"]), fmt(s["ctx_latest"]), s["turns"],
+             fmt(s["total"]), ", ".join(s["reasons"]), s["status"].lower())
+            for s in ordered]
+
 
 QUOTA_ORDER = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
 QUOTA_LABEL_KEY = {
@@ -289,7 +324,7 @@ class MonitorGUI:
         root.title("Claude Usage Monitor")
         root.geometry("980x720")
         root.configure(bg=BG)
-        root.minsize(780, 560)
+        root.minsize(940, 700)
 
         self.config = load_config()
         self.lang = self.config.get("lang", "en")
@@ -299,13 +334,14 @@ class MonitorGUI:
 
         self._setup_style()
         self._build_header()
+        self._build_statusbar()  # packed before the notebook so it never gets squeezed out
         self._build_tabs()
-        self._build_statusbar()
 
         self.loading = False
         self.tray = None
         self.today_cost_text = "$0.00"
         self.entries_cache = None
+        self.sessions_cache = []
         self.quota_cache = None  # last {"data": {...}} or {"error": "code"}
         self.next_refresh_at = None
         self._refresh_timer = None
@@ -456,6 +492,7 @@ class MonitorGUI:
         self._apply_language()
         if self.entries_cache is not None:
             self._render(self.entries_cache)  # redraw dynamic texts
+            self._render_sessions(self.sessions_cache)
         self._render_quota(self.quota_cache)
 
     def _apply_language(self):
@@ -468,6 +505,9 @@ class MonitorGUI:
         self.note.config(text=note)
         self.quota_title.config(text=tr("quota_title"))
         self.quota_note.config(text=tr("quota_source"))
+        self.sess_title.config(text=tr("sess_title"))
+        self.sess_empty.config(text=tr("sess_empty"))
+        self.sess_note.config(text=tr("sess_note"))
         for i, key in enumerate(self.tab_keys):
             self.nb.tab(i, text=tr(key))
         for tree, keys in self.trees:
@@ -639,6 +679,34 @@ class MonitorGUI:
                                    fg=FG_DIM, font=("Segoe UI", 8), anchor="w")
         self.quota_note.pack(fill="x", pady=(6, 0))
 
+        # -- active sessions card (full width, row 2)
+        self.trees = []
+        outer, sess = self._card(top)
+        outer.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(10, 0))
+        head = tk.Frame(sess, bg=BG_CARD)
+        head.pack(fill="x")
+        self.sess_title = tk.Label(head, text=tr("sess_title"), bg=BG_CARD, fg=FG,
+                                   font=FONT_SERIF, anchor="w")
+        self.sess_title.pack(side="left")
+        self.sess_window = tk.Label(head, bg=BG_CARD, fg=FG_DIM,
+                                    font=("Segoe UI", 8), anchor="e")
+        self.sess_window.pack(side="right")
+        self.sess_empty = tk.Label(sess, text=tr("loading"), bg=BG_CARD, fg=FG_DIM,
+                                   font=FONT_UI, anchor="w")
+        self.sess_table, self.tree_sessions = self._make_tree(
+            sess, ("col_status", "col_session", "col_model", "col_context",
+                   "col_turns", "col_sess_total", "col_reason"),
+            (70, 190, 80, 70, 55, 95, 260),
+            ("w", "w", "w", "e", "e", "e", "w"))
+        self.tree_sessions.configure(height=1)
+        self.tree_sessions.tag_configure("switch", foreground=RED)
+        self.tree_sessions.tag_configure("review", foreground=YELLOW)
+        self.tree_sessions.tag_configure("keep", foreground=GREEN)
+        self.sess_note = tk.Label(sess, text=tr("sess_note"), bg=BG_CARD, fg=FG_DIM,
+                                  font=("Segoe UI", 8), anchor="w")
+        self.sess_note.pack(side="bottom", fill="x", pady=(6, 0))
+        self.sess_empty.pack(fill="x", pady=(4, 0))
+
     # ----------------------------------------------------------------- tabs
     def _make_tree(self, parent, keys, widths, anchors):
         frame = tk.Frame(parent, bg=BG_CARD)
@@ -649,15 +717,14 @@ class MonitorGUI:
         for col, key, w, a in zip(cols, keys, widths, anchors):
             tree.heading(col, text=self.tr(key))
             tree.column(col, width=w, anchor=a, stretch=(a == "w"))
-        tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
         tree.tag_configure("total", background=BG_CARD, foreground=ACCENT_D)
         tree.tag_configure("active", foreground=GREEN)
         self.trees.append((tree, keys))
         return frame, tree
 
     def _build_tabs(self):
-        self.trees = []
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=12, pady=(0, 4))
         self.tab_keys = ["tab_daily", "tab_models", "tab_projects",
@@ -765,7 +832,11 @@ class MonitorGUI:
         except Exception as exc:  # surface parse failures in the status bar
             self.root.after(0, self._on_error, str(exc))
             return
-        self.root.after(0, self._on_loaded, entries)
+        try:
+            sessions = find_active_sessions(ACTIVE_WINDOW_MINUTES)
+        except Exception:  # never let session parsing break the dashboard
+            sessions = []
+        self.root.after(0, self._on_loaded, entries, sessions)
 
     def _load_quota(self):
         """Runs in a background thread — independent of local file parsing,
@@ -790,10 +861,12 @@ class MonitorGUI:
         self.status.config(text=self.tr("status_err").format(m=msg), fg=RED)
         self._schedule_refresh()
 
-    def _on_loaded(self, entries):
+    def _on_loaded(self, entries, sessions=()):
         self.loading = False
         self.entries_cache = entries
+        self.sessions_cache = list(sessions)
         self._render(entries)
+        self._render_sessions(self.sessions_cache)
         self.status.config(
             text=self.tr("status_ok").format(
                 t=datetime.now().strftime("%H:%M:%S"), n=len(entries)),
@@ -855,6 +928,19 @@ class MonitorGUI:
                      bg=BG_CARD, fg=(color if w["pct"] >= 85 else FG),
                      font=FONT_MONO, anchor="w").pack(side="left")
             idx = (idx + 1) % 4
+
+    # ------------------------------------------------------ active sessions
+    def _render_sessions(self, sessions):
+        self.sess_window.config(text=self.tr("sess_window").format(m=ACTIVE_WINDOW_MINUTES))
+        rows = session_rows(sessions)
+        if not rows:
+            self.sess_table.pack_forget()
+            self.sess_empty.pack(fill="x", pady=(4, 0))
+            return
+        self.sess_empty.pack_forget()
+        self.tree_sessions.configure(height=min(len(rows), SESSION_ROWS_VISIBLE))
+        self.sess_table.pack(fill="x", pady=(4, 0))
+        self._fill(self.tree_sessions, rows, tagged=True)
 
     # --------------------------------------------------------------- render
     def _render(self, entries):
