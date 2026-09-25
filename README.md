@@ -75,6 +75,7 @@ On Linux, if Tkinter is missing: `sudo apt install python3-tk` (Debian/Ubuntu) o
 ```bash
 python claude_monitor.py            # summary: current 5h window + today + last 7 days
 python claude_monitor.py live      # live terminal dashboard (Ctrl+C to quit)
+python claude_monitor.py sessions  # active sessions: context estimate + KEEP/REVIEW/SWITCH (--active-minutes N)
 ```
 
 ---

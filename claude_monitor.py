@@ -17,6 +17,7 @@ Usage:
   python claude_monitor.py projects      # per-project breakdown
   python claude_monitor.py blocks        # 5-hour rate-limit blocks (--limit N)
   python claude_monitor.py live          # live dashboard (--interval N seconds)
+  python claude_monitor.py sessions      # active sessions + context status (--active-minutes N)
 
 Note: if you are on a Pro/Max subscription you don't pay per token; the cost
 shown is the API-equivalent value of your usage.
@@ -320,6 +321,132 @@ def blocks_of(entries, hours=5):
     return blocks
 
 
+# --------------------------------------------------------- active sessions ---
+# Thresholds from the historical audit (audit/README.md). Each metric maps to
+# (REVIEW at >=, SWITCH at >=); context switches only when strictly > 250K.
+ACTIVE_WINDOW_MINUTES = 120
+CTX_REVIEW, CTX_SWITCH = 150_000, 250_000
+TURNS_REVIEW, TURNS_SWITCH = 40, 80
+TOTAL_REVIEW, TOTAL_SWITCH = 3_000_000, 10_000_000
+STATUSES = ("KEEP", "REVIEW", "SWITCH")
+
+
+def _parse_ts(raw):
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def _is_user_prompt(obj):
+    if obj.get("isMeta") or obj.get("isCompactSummary"):
+        return False
+    content = (obj.get("message") or {}).get("content")
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return False
+        content = " ".join(b.get("text", "") for b in content
+                           if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(content, str) or not content.strip():
+        return False
+    return not content.lstrip().startswith(("<local-command-", "Caveat:"))
+
+
+def read_session(path):
+    """Summarise one transcript. Streamed chunks of one reply share a
+    message.id and are merged (max per usage field). Context/history of a
+    turn = input + cache_creation + cache_read tokens of that request."""
+    turns = {}
+    info = {"session_id": Path(path).stem, "cwd": None, "model": "", "start": None,
+            "last": None, "prompts": 0}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = _parse_ts(obj.get("timestamp"))
+                if ts:
+                    info["start"] = min(info["start"] or ts, ts)
+                    info["last"] = max(info["last"] or ts, ts)
+                info["cwd"] = obj.get("cwd") or info["cwd"]
+                if obj.get("type") == "user" and _is_user_prompt(obj):
+                    info["prompts"] += 1
+                    continue
+                msg = obj.get("message") or {}
+                usage = msg.get("usage")
+                if obj.get("type") != "assistant" or not usage or msg.get("model") == "<synthetic>":
+                    continue
+                key = msg.get("id") or obj.get("requestId") or obj.get("uuid")
+                t = turns.setdefault(key, {"input": 0, "output": 0, "cache_w": 0,
+                                           "cache_r": 0, "sidechain": bool(obj.get("isSidechain"))})
+                for k, src in (("input", "input_tokens"), ("output", "output_tokens"),
+                               ("cache_w", "cache_creation_input_tokens"),
+                               ("cache_r", "cache_read_input_tokens")):
+                    t[k] = max(t[k], usage.get(src) or 0)
+                info["model"] = msg.get("model") or info["model"]
+    except OSError:
+        return None
+    main = [t for t in turns.values() if not t["sidechain"]]
+    ctx = [t["input"] + t["cache_w"] + t["cache_r"] for t in main]
+    info.update(
+        turns=len(main),
+        total=sum(t["input"] + t["output"] + t["cache_w"] + t["cache_r"] for t in turns.values()),
+        ctx_latest=ctx[-1] if ctx else 0,
+        ctx_peak=max(ctx) if ctx else 0,
+    )
+    return info
+
+
+def _level(value, review, switch, strict_switch=False):
+    if value > switch if strict_switch else value >= switch:
+        return 2
+    return 1 if value >= review else 0
+
+
+def session_status(s):
+    """Return (status, reasons): the strongest of context, turns and total."""
+    checks = [
+        (_level(s["ctx_latest"], CTX_REVIEW, CTX_SWITCH, strict_switch=True), f"ctx {fmt(s['ctx_latest'])}"),
+        (_level(s["turns"], TURNS_REVIEW, TURNS_SWITCH), f"turns {s['turns']}"),
+        (_level(s["total"], TOTAL_REVIEW, TOTAL_SWITCH), f"total {fmt(s['total'])}"),
+    ]
+    worst = max(lvl for lvl, _ in checks)
+    return STATUSES[worst], [why for lvl, why in checks if worst and lvl == worst]
+
+
+def find_active_sessions(window_minutes=ACTIVE_WINDOW_MINUTES, now=None, dirs=None):
+    """Sessions whose transcript has a record within the last `window_minutes`.
+    Sub-agent transcripts (<session>/subagents/*.jsonl) add to the parent's
+    total but not to its context or turn count."""
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=window_minutes)
+    sessions, sub_paths = {}, defaultdict(list)
+    for base in (dirs if dirs is not None else data_dirs()):
+        for path in Path(base).rglob("*.jsonl"):
+            try:
+                if path.stat().st_mtime < cutoff.timestamp():
+                    continue  # untouched since before the window: not active
+            except OSError:
+                continue
+            if path.parent.name == "subagents":
+                sub_paths[path.parent.parent.name].append(path)
+                continue
+            s = read_session(path)
+            if s and s["last"] and s["last"] >= cutoff and (s["turns"] or s["prompts"]):
+                s["project"] = Path(s["cwd"]).name if s["cwd"] else path.parent.name
+                sessions[s["session_id"]] = s
+    for sid, paths in sub_paths.items():
+        if sid in sessions:
+            for p in paths:
+                sub = read_session(p)
+                sessions[sid]["total"] += sub["total"] if sub else 0
+    for s in sessions.values():
+        s["status"], s["reasons"] = session_status(s)
+    return sorted(sessions.values(), key=lambda s: s["last"], reverse=True)
+
+
 # -------------------------------------------------------------- formatting ---
 def supports_color():
     # under pythonw (GUI, no console) sys.stdout is None — never touch it
@@ -567,6 +694,39 @@ def cmd_account():
     print(table(["Window", "Used", "Reset"], rows, aligns=["<", ">", "<"]))
 
 
+def pretty_model(m):
+    """claude-opus-5-5 -> Opus 5.5, claude-haiku-4-5-20251001 -> Haiku 4.5."""
+    parts = [p for p in short_model(m).split("-") if not (p.isdigit() and len(p) == 8)]
+    if not parts or parts == ["?"]:
+        return "?"
+    return " ".join([parts[0].capitalize()] + ([".".join(parts[1:])] if parts[1:] else []))
+
+
+def cmd_sessions(window_minutes):
+    sessions = find_active_sessions(window_minutes)
+    print(bold(f"\nActive Claude Code sessions (activity in last {window_minutes} min)\n"))
+    if not sessions:
+        print(dim("  No active sessions."))
+    colors = {"KEEP": green, "REVIEW": yellow, "SWITCH": red}
+    for s in sessions:
+        status = colors[s["status"]](s["status"])
+        print(f"{bold(s['project'])} [{s['session_id'][:6]}] | {pretty_model(s['model'])}"
+              f" | ctx {fmt(s['ctx_latest'])} {status} | turns {s['turns']} | total {fmt(s['total'])}")
+        why = f"   triggered by: {', '.join(s['reasons'])}" if s["reasons"] else ""
+        print(dim(f"    started {local(s['start']).strftime('%m-%d %H:%M')}"
+                  f" | last {local(s['last']).strftime('%m-%d %H:%M')}"
+                  f" | prompts {s['prompts']} | peak ctx {fmt(s['ctx_peak'])}{why}"))
+        print(dim(f"    {s['cwd'] or '?'}"))
+    print()
+    print(dim("  ctx   = estimated conversation history sent on the latest turn (input + cache\n"
+              "          write + cache read, from the transcript). Absolute tokens, not a % of the\n"
+              "          window: the transcript doesn't record 200K vs 1M, and it lags one turn."))
+    print(dim("  total = cumulative tokens consumed by the session, incl. sub-agents."))
+    print(dim("  5h / weekly account quota is separate: `python claude_monitor.py account`."))
+    print(dim(f"  Status: ctx <{fmt(CTX_REVIEW)} KEEP, <={fmt(CTX_SWITCH)} REVIEW, above SWITCH;"
+              f" turns {TURNS_REVIEW}/{TURNS_SWITCH}; total {fmt(TOTAL_REVIEW)}/{fmt(TOTAL_SWITCH)}."))
+
+
 def cmd_summary(entries):
     now = datetime.now(timezone.utc)
     print(render_live(entries))
@@ -582,10 +742,12 @@ def main():
     ap = argparse.ArgumentParser(description="Claude Code usage monitor")
     ap.add_argument("command", nargs="?", default="summary",
                     choices=["summary", "daily", "monthly", "models", "projects",
-                             "blocks", "live", "account"])
+                             "blocks", "live", "account", "sessions"])
     ap.add_argument("--days", type=int, default=14, help="days for daily report")
     ap.add_argument("--limit", type=int, default=10, help="number of blocks to show")
     ap.add_argument("--interval", type=int, default=10, help="live refresh seconds")
+    ap.add_argument("--active-minutes", type=int, default=ACTIVE_WINDOW_MINUTES,
+                    help="sessions: activity window for 'active' (default 120)")
     args = ap.parse_args()
 
     if not data_dirs():
@@ -597,6 +759,9 @@ def main():
         return
     if args.command == "account":
         cmd_account()
+        return
+    if args.command == "sessions":
+        cmd_sessions(args.active_minutes)
         return
 
     entries = load_entries()
