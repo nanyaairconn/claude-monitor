@@ -123,8 +123,8 @@ class SessionTests(unittest.TestCase):
             return cm.session_status({"ctx_latest": ctx, "turns": turns, "total": total})[0]
         self.assertEqual(status(ctx=149_999), "KEEP")
         self.assertEqual(status(ctx=150_000), "REVIEW")
-        self.assertEqual(status(ctx=250_000), "REVIEW")
-        self.assertEqual(status(ctx=250_001), "SWITCH")
+        self.assertEqual(status(ctx=249_999), "REVIEW")
+        self.assertEqual(status(ctx=250_000), "SWITCH")
         self.assertEqual(status(turns=39), "KEEP")
         self.assertEqual(status(turns=40), "REVIEW")
         self.assertEqual(status(turns=80), "SWITCH")

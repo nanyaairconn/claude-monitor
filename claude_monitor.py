@@ -323,7 +323,7 @@ def blocks_of(entries, hours=5):
 
 # --------------------------------------------------------- active sessions ---
 # Thresholds from the historical audit (audit/README.md). Each metric maps to
-# (REVIEW at >=, SWITCH at >=); context switches only when strictly > 250K.
+# (REVIEW at >=, SWITCH at >=).
 ACTIVE_WINDOW_MINUTES = 120
 CTX_REVIEW, CTX_SWITCH = 150_000, 250_000
 TURNS_REVIEW, TURNS_SWITCH = 40, 80
@@ -399,8 +399,8 @@ def read_session(path):
     return info
 
 
-def _level(value, review, switch, strict_switch=False):
-    if value > switch if strict_switch else value >= switch:
+def _level(value, review, switch):
+    if value >= switch:
         return 2
     return 1 if value >= review else 0
 
@@ -408,7 +408,7 @@ def _level(value, review, switch, strict_switch=False):
 def session_status(s):
     """Return (status, reasons): the strongest of context, turns and total."""
     checks = [
-        (_level(s["ctx_latest"], CTX_REVIEW, CTX_SWITCH, strict_switch=True), f"ctx {fmt(s['ctx_latest'])}"),
+        (_level(s["ctx_latest"], CTX_REVIEW, CTX_SWITCH), f"ctx {fmt(s['ctx_latest'])}"),
         (_level(s["turns"], TURNS_REVIEW, TURNS_SWITCH), f"turns {s['turns']}"),
         (_level(s["total"], TOTAL_REVIEW, TOTAL_SWITCH), f"total {fmt(s['total'])}"),
     ]
@@ -724,7 +724,7 @@ def cmd_sessions(window_minutes):
               "          window: the transcript doesn't record 200K vs 1M, and it lags one turn."))
     print(dim("  total = cumulative tokens consumed by the session, incl. sub-agents."))
     print(dim("  5h / weekly account quota is separate: `python claude_monitor.py account`."))
-    print(dim(f"  Status: ctx <{fmt(CTX_REVIEW)} KEEP, <={fmt(CTX_SWITCH)} REVIEW, above SWITCH;"
+    print(dim(f"  Status (REVIEW/SWITCH at >=): ctx {fmt(CTX_REVIEW)}/{fmt(CTX_SWITCH)};"
               f" turns {TURNS_REVIEW}/{TURNS_SWITCH}; total {fmt(TOTAL_REVIEW)}/{fmt(TOTAL_SWITCH)}."))
 
 
