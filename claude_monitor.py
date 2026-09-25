@@ -425,13 +425,14 @@ def find_active_sessions(window_minutes=ACTIVE_WINDOW_MINUTES, now=None, dirs=No
     sessions, sub_paths = {}, defaultdict(list)
     for base in (dirs if dirs is not None else data_dirs()):
         for path in Path(base).rglob("*.jsonl"):
+            if path.parent.name == "subagents":
+                # no mtime filter: an early sub-agent still counts toward an active parent
+                sub_paths[path.parent.parent.name].append(path)
+                continue
             try:
                 if path.stat().st_mtime < cutoff.timestamp():
                     continue  # untouched since before the window: not active
             except OSError:
-                continue
-            if path.parent.name == "subagents":
-                sub_paths[path.parent.parent.name].append(path)
                 continue
             s = read_session(path)
             if s and s["last"] and s["last"] >= cutoff and (s["turns"] or s["prompts"]):

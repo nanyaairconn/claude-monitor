@@ -109,6 +109,15 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(s2["ctx_latest"], 2_002)
         self.assertEqual(s2["total"], (2 + 100 + 2_000) + (2 + 100 + 5_000))
 
+    def test_old_subagent_still_counts_toward_active_parent(self):
+        old, new = NOW - timedelta(hours=3), NOW - timedelta(minutes=2)
+        self.write("p/s.jsonl", [assistant(old, "a"), assistant(new, "b")])
+        self.write("p/s/subagents/agent-1.jsonl",
+                   [assistant(old, "c", cr=4_000_000, isSidechain=True)], mtime=old)
+        [s] = self.active()
+        self.assertEqual(s["total"], 2 * (2 + 100) + (2 + 100 + 4_000_000))
+        self.assertEqual(s["status"], "REVIEW")
+
     def test_threshold_classification(self):
         def status(ctx=0, turns=0, total=0):
             return cm.session_status({"ctx_latest": ctx, "turns": turns, "total": total})[0]
