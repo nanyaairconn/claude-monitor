@@ -4,3 +4,7 @@ build/
 dist/
 *.spec
 config.json
+
+# Historical audit outputs (private, regenerated locally)
+audit/sessions.csv
+audit/turns.csv
