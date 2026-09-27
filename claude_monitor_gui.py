@@ -130,6 +130,7 @@ L = {
         "sess_title":     "活跃会话",
         "sess_window":    "最近 {m} 分钟内有活动",
         "sess_empty":     "当前没有活跃的 Claude Code 会话。",
+        "sess_unavail":   "活跃会话暂不可用：{e}",
         "sess_note":      "上下文 = 最近一轮的估算历史长度（来自记录文件，非精确） · 会话总量 = 本会话累计 token · 与上方账号配额无关",
         "col_session":    "会话",
         "col_model":      "模型",
@@ -228,6 +229,7 @@ L = {
         "sess_title":     "Active Sessions",
         "sess_window":    "activity in last {m} min",
         "sess_empty":     "No active Claude Code sessions.",
+        "sess_unavail":   "Active Sessions unavailable: {e}",
         "sess_note":      "Context = estimated history on the latest turn (from transcript, not exact) · Session total = cumulative tokens · Separate from account quota above",
         "col_session":    "Session",
         "col_model":      "Model",
@@ -337,11 +339,14 @@ class MonitorGUI:
         self._build_statusbar()  # packed before the notebook so it never gets squeezed out
         self._build_tabs()
 
-        self.loading = False
+        self.loading = False          # active-sessions load in flight
+        self.entries_loading = False  # historical scan in flight (may outlive a refresh cycle)
+        self.entry_cache = claude_monitor.EntryCache()  # re-parses only changed transcripts
         self.tray = None
         self.today_cost_text = "$0.00"
         self.entries_cache = None
         self.sessions_cache = []
+        self.sessions_error = None  # last find_active_sessions/render failure, if any
         self.quota_cache = None  # last {"data": {...}} or {"error": "code"}
         self.next_refresh_at = None
         self._refresh_timer = None
@@ -492,6 +497,7 @@ class MonitorGUI:
         self._apply_language()
         if self.entries_cache is not None:
             self._render(self.entries_cache)  # redraw dynamic texts
+        if not self.loading:  # sessions render independently of entries
             self._render_sessions(self.sessions_cache)
         self._render_quota(self.quota_cache)
 
@@ -821,22 +827,32 @@ class MonitorGUI:
         if self.loading:
             return
         self.loading = True
-        self.status.config(text=self.tr("loading_data"))
-        threading.Thread(target=self._load, daemon=True).start()
+        threading.Thread(target=self._load_sessions, daemon=True).start()
+        if not self.entries_loading:  # never stack a second historical scan
+            self.entries_loading = True
+            self.status.config(text=self.tr("loading_data"))
+            threading.Thread(target=self._load_entries, daemon=True).start()
         self.quota_sync.config(text=self.tr("quota_syncing"))
         threading.Thread(target=self._load_quota, daemon=True).start()
 
-    def _load(self):
+    def _load_sessions(self):
+        """Background thread: active sessions only (mtime-filtered, fast) —
+        independent of the historical scan so the card never waits on it."""
+        # always schedule exactly one UI callback, on success or failure
         try:
-            entries = load_entries()
+            sessions, error = find_active_sessions(ACTIVE_WINDOW_MINUTES), None
+        except Exception as exc:  # never let session parsing break the dashboard
+            sessions, error = [], str(exc) or type(exc).__name__
+        self.root.after(0, self._on_sessions_loaded, sessions, error)
+
+    def _load_entries(self):
+        """Background thread: historical entries for Block/Daily/Models/Projects/Monthly."""
+        try:
+            entries = self.entry_cache.load()
         except Exception as exc:  # surface parse failures in the status bar
             self.root.after(0, self._on_error, str(exc))
             return
-        try:
-            sessions = find_active_sessions(ACTIVE_WINDOW_MINUTES)
-        except Exception:  # never let session parsing break the dashboard
-            sessions = []
-        self.root.after(0, self._on_loaded, entries, sessions)
+        self.root.after(0, self._on_entries_loaded, entries)
 
     def _load_quota(self):
         """Runs in a background thread — independent of local file parsing,
@@ -857,21 +873,30 @@ class MonitorGUI:
         self._render_quota(result)
 
     def _on_error(self, msg):
-        self.loading = False
+        self.entries_loading = False
         self.status.config(text=self.tr("status_err").format(m=msg), fg=RED)
-        self._schedule_refresh()
 
-    def _on_loaded(self, entries, sessions=()):
+    def _on_sessions_loaded(self, sessions, error=None):
+        # owns the single existing auto-refresh timer
         self.loading = False
-        self.entries_cache = entries
         self.sessions_cache = list(sessions)
+        self.sessions_error = error
+        try:
+            self._render_sessions(self.sessions_cache)
+        except Exception as exc:  # a bad row must not leave the card on "Loading..."
+            self.sessions_error = str(exc) or type(exc).__name__
+            self._render_sessions([])
+        finally:
+            self._schedule_refresh()  # keep auto refresh alive no matter what
+
+    def _on_entries_loaded(self, entries):
+        self.entries_loading = False
+        self.entries_cache = entries
         self._render(entries)
-        self._render_sessions(self.sessions_cache)
         self.status.config(
             text=self.tr("status_ok").format(
                 t=datetime.now().strftime("%H:%M:%S"), n=len(entries)),
             fg=FG_DIM)
-        self._schedule_refresh()
 
     # --------------------------------------------------------- live quota
     def _render_quota(self, result):
@@ -932,8 +957,12 @@ class MonitorGUI:
     # ------------------------------------------------------ active sessions
     def _render_sessions(self, sessions):
         self.sess_window.config(text=self.tr("sess_window").format(m=ACTIVE_WINDOW_MINUTES))
-        rows = session_rows(sessions)
+        rows = [] if self.sessions_error else session_rows(sessions)
         if not rows:
+            # the label is created showing "Loading..."; always set its final text
+            self.sess_empty.config(text=(
+                self.tr("sess_unavail").format(e=self.sessions_error)
+                if self.sessions_error else self.tr("sess_empty")))
             self.sess_table.pack_forget()
             self.sess_empty.pack(fill="x", pady=(4, 0))
             return

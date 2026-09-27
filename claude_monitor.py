@@ -105,64 +105,119 @@ def data_dirs():
     return dirs
 
 
-def load_entries(since=None):
-    """Parse all transcripts; return a list of usage entries sorted by time."""
+def _parse_file(path):
+    """Parse one transcript into [(dedupe_key, entry_or_None), ...] in line
+    order. entry is None for records that carry usage but no usable timestamp:
+    they still consume their dedupe key, exactly as load_entries always did.
+    Returns (records, ok); ok is False if the file could not be fully read."""
+    records = []
+    project = path.parent.name
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "assistant":
+                    continue
+                msg = obj.get("message") or {}
+                usage = msg.get("usage")
+                if not usage:
+                    continue
+                key = (msg.get("id"), obj.get("requestId"))
+                ts_raw = obj.get("timestamp")
+                ts = None
+                if ts_raw:
+                    try:
+                        ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                    except ValueError:
+                        ts = None
+                if ts is None:
+                    records.append((key, None))
+                    continue
+                cc = usage.get("cache_creation") or {}
+                c5m = cc.get("ephemeral_5m_input_tokens")
+                c1h = cc.get("ephemeral_1h_input_tokens")
+                if c5m is None and c1h is None:
+                    # older records: no split, assume 5m
+                    c5m = usage.get("cache_creation_input_tokens", 0) or 0
+                    c1h = 0
+                records.append((key, {
+                    "ts": ts,
+                    "model": msg.get("model") or "",
+                    "project": project,
+                    "input": usage.get("input_tokens", 0) or 0,
+                    "output": usage.get("output_tokens", 0) or 0,
+                    "cache_5m": c5m or 0,
+                    "cache_1h": c1h or 0,
+                    "cache_read": usage.get("cache_read_input_tokens", 0) or 0,
+                }))
+    except OSError:
+        return records, False
+    return records, True
+
+
+def _merge_records(per_file, since=None):
+    """Dedupe retried/streamed duplicates across files (first occurrence wins,
+    in file order) and apply `since`. per_file: iterable of record lists."""
     entries = []
     seen = set()
-    for base in data_dirs():
-        for path in base.rglob("*.jsonl"):
-            project = path.parent.name
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        if '"usage"' not in line:
-                            continue
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if obj.get("type") != "assistant":
-                            continue
-                        msg = obj.get("message") or {}
-                        usage = msg.get("usage")
-                        if not usage:
-                            continue
-                        # dedupe retried/streamed duplicates
-                        key = (msg.get("id"), obj.get("requestId"))
-                        if key != (None, None):
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                        ts_raw = obj.get("timestamp")
-                        if not ts_raw:
-                            continue
-                        try:
-                            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                        except ValueError:
-                            continue
-                        if since and ts < since:
-                            continue
-                        cc = usage.get("cache_creation") or {}
-                        c5m = cc.get("ephemeral_5m_input_tokens")
-                        c1h = cc.get("ephemeral_1h_input_tokens")
-                        if c5m is None and c1h is None:
-                            # older records: no split, assume 5m
-                            c5m = usage.get("cache_creation_input_tokens", 0) or 0
-                            c1h = 0
-                        entries.append({
-                            "ts": ts,
-                            "model": msg.get("model") or "",
-                            "project": project,
-                            "input": usage.get("input_tokens", 0) or 0,
-                            "output": usage.get("output_tokens", 0) or 0,
-                            "cache_5m": c5m or 0,
-                            "cache_1h": c1h or 0,
-                            "cache_read": usage.get("cache_read_input_tokens", 0) or 0,
-                        })
-            except OSError:
+    for records in per_file:
+        for key, e in records:
+            if key != (None, None):
+                if key in seen:
+                    continue
+                seen.add(key)
+            if e is None:
                 continue
+            if since and e["ts"] < since:
+                continue
+            entries.append(e)
     entries.sort(key=lambda e: e["ts"])
     return entries
+
+
+def _transcript_paths():
+    for base in data_dirs():
+        yield from base.rglob("*.jsonl")
+
+
+def load_entries(since=None):
+    """Parse all transcripts; return a list of usage entries sorted by time."""
+    return _merge_records((_parse_file(p)[0] for p in _transcript_paths()), since)
+
+
+class EntryCache:
+    """Same result as load_entries(), but re-parses only transcripts whose
+    (size, mtime) changed since the previous call. Not thread-safe: use from
+    one thread at a time."""
+
+    def __init__(self):
+        self._files = {}  # path -> (signature, records)
+
+    def load(self, since=None):
+        fresh, ordered = {}, []
+        for path in _transcript_paths():
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            sig = (st.st_size, st.st_mtime_ns)
+            hit = self._files.get(path)
+            if hit and hit[0] == sig:
+                records = hit[1]
+            else:
+                records, ok = _parse_file(path)
+                if not ok:
+                    ordered.append(records)
+                    continue  # don't cache a partial read
+            fresh[path] = (sig, records)
+            ordered.append(records)
+        self._files = fresh  # drops deleted files
+        return _merge_records(ordered, since)
 
 
 # -------------------------------------------------------------- aggregation ---
